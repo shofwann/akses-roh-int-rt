@@ -23,12 +23,13 @@ set KODE=%ERRORLEVEL%
 echo.
 if %KODE% neq 0 (
     echo *** Selesai dengan error. Baca pesan di atas. ***
+    echo.
+    rem Error ditahan supaya pesannya sempat dibaca.
+    pause
 ) else (
     echo *** Selesai. ***
     echo.
     echo   Langkah berikutnya: buka shofwans_tools_v4.xlsx,
     echo   lalu Data ^> Refresh All  [Ctrl+Alt+F5]  untuk menarik data baru.
 )
-echo.
-pause
 exit /b %KODE%

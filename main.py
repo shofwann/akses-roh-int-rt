@@ -47,6 +47,93 @@ if not VERIFY_SSL:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
+class Progres:
+    """Bar proses satu baris yang menimpa dirinya sendiri di terminal.
+
+    Kalau output dialihkan ke file (bukan terminal), animasinya dimatikan dan
+    tiap langkah tetap tercetak sebagai baris biasa supaya log utuh terbaca.
+    """
+
+    def __init__(self, total: int, lebar: int = 28):
+        self.total = max(total, 1)
+        self.lebar = lebar
+        self.n = 0
+        self.teks = ""
+        self.hidup = sys.stdout.isatty()
+        self.sisa = 0
+        # CMD dengan font lama tidak punya blok Unicode - mundur ke ASCII.
+        self.isi, self.kosong = ("\u2588", "\u2591") if muat("\u2588") else ("#", "-")
+
+    def gambar(self) -> None:
+        if not self.hidup:
+            return
+        rasio = min(self.n / self.total, 1.0)
+        penuh = round(self.lebar * rasio)
+        bar = self.isi * penuh + self.kosong * (self.lebar - penuh)
+        baris = f"  [{bar}] {rasio * 100:3.0f}%  {self.teks}"
+        sys.stdout.write("\r" + baris + " " * max(self.sisa - len(baris), 0))
+        sys.stdout.flush()
+        self.sisa = len(baris)
+
+    def label(self, teks: str) -> None:
+        self.teks = teks
+        self.gambar()
+
+    def maju(self, teks: str = "") -> None:
+        self.n += 1
+        if teks:
+            self.teks = teks
+        self.gambar()
+
+    def catat(self, teks: str) -> None:
+        """Cetak baris permanen di atas bar, lalu gambar ulang barnya."""
+        if self.hidup:
+            sys.stdout.write("\r" + " " * self.sisa + "\r")
+            self.sisa = 0
+        print(teks)
+        self.gambar()
+
+    def tutup(self, teks: str = "selesai") -> None:
+        self.n = self.total
+        self.teks = teks
+        self.gambar()
+        if self.hidup:
+            print()
+
+
+BAR: "Progres | None" = None
+
+
+def muat(ch: str) -> bool:
+    """Apakah karakter ini bisa dicetak di encoding konsol saat ini?"""
+    try:
+        ch.encode(getattr(sys.stdout, "encoding", None) or "utf-8")
+    except (UnicodeEncodeError, LookupError):
+        return False
+    return True
+
+
+def catat(teks: str) -> None:
+    """Cetak tanpa merusak bar proses yang sedang tampil."""
+    if BAR is None:
+        print(teks)
+    else:
+        BAR.catat(teks)
+
+
+def bagan(hasil: dict[str, pd.DataFrame], lebar: int = 24) -> None:
+    """Bagan batang jumlah baris per modul, relatif terhadap yang terbesar."""
+    if not hasil:
+        return
+    isi, kosong = ("\u2588", "\u2591") if muat("\u2588") else ("#", ".")
+    maks = max(df.shape[0] for df in hasil.values())
+    print("\nbaris per modul:")
+    for sheet, df in hasil.items():
+        n = df.shape[0]
+        panjang = max(round(lebar * n / maks), 1)
+        print(f"  {sheet:<4} {isi * panjang}{kosong * (lebar - panjang)}  {n:>4}")
+
+
 def sesi_dari_url(url: str) -> str:
     """Ambil nilai sSession dari sebuah URL hasil paste."""
     return dict(parse_qsl(urlparse(url).query, keep_blank_values=True)).get("sSession", "")
@@ -179,14 +266,27 @@ def buang_kolom_mw_mx(df: pd.DataFrame) -> pd.DataFrame:
     if not isi or not isi <= PENANDA_MW_MX:
         return df
     hasil = df[df[kol].astype(str).str.strip() != "MX"].drop(columns=[kol])
-    print(f"    kolom {kol!r} dihapus, {len(df) - len(hasil)} baris MX dibuang")
+    catat(f"    kolom {kol!r} dihapus, {len(df) - len(hasil)} baris MX dibuang")
     return hasil.reset_index(drop=True)
 
 
-def ambil_data(kode_sys: str) -> pd.DataFrame | None:
+def ambil_data(kode_sys: str, nama: str = "") -> pd.DataFrame | None:
     """Unduh satu modul dan kembalikan tabel datanya."""
-    html = requests.get(bangun_url(kode_sys), timeout=60, verify=VERIFY_SSL).text
-    print(f"    panjang html: {len(html)}")
+    with requests.get(bangun_url(kode_sys), timeout=60, verify=VERIFY_SSL, stream=True) as r:
+        besar = int(r.headers.get("Content-Length") or 0)
+        potongan, masuk = [], 0
+        for blok in r.iter_content(65536):
+            potongan.append(blok)
+            masuk += len(blok)
+            if BAR is not None:
+                dari = f" / {besar // 1024} KB" if besar else ""
+                BAR.label(f"{nama} mengunduh {masuk // 1024} KB{dari}")
+        # Pasang balik isinya sebagai Response utuh supaya .text tetap memakai
+        # deteksi encoding milik requests - sama persis seperti sebelum stream.
+        r._content = b"".join(potongan)
+        r._content_consumed = True
+        html = r.text
+    catat(f"    panjang html: {len(html)}")
     if sesi_kedaluwarsa(html):
         raise RuntimeError("session kedaluwarsa - paste ulang HDKS_LOGIN_URL di .env")
 
@@ -195,7 +295,7 @@ def ambil_data(kode_sys: str) -> pd.DataFrame | None:
     # kolomnya terbaca 0,1,2,... dan label jam ikut dikonversi jadi angka
     # ("00.30" -> 0.3). Kalau itu yang terjadi, baca ulang dengan header=0.
     if df is not None and all(isinstance(c, int) for c in df.columns):
-        print("    header tidak terdeteksi, baca ulang dengan header=0")
+        catat("    header tidak terdeteksi, baca ulang dengan header=0")
         df = pilih_tabel(pd.read_html(StringIO(html), header=0))
     return df
 
@@ -213,7 +313,7 @@ def tulis_raw(sheet: str, df: pd.DataFrame) -> bool:
     """Tulis satu dataset ke raw/<sheet>.xlsx, timpa sheet pertamanya."""
     berkas = RAW_DIR / f"{sheet}.xlsx"
     if not berkas.exists():
-        print(f"    lewat raw: {berkas} tidak ada")
+        catat(f"    lewat raw: {berkas} tidak ada")
         return False
     try:
         target = nama_sheet_pertama(berkas)
@@ -222,16 +322,16 @@ def tulis_raw(sheet: str, df: pd.DataFrame) -> bool:
         ) as writer:
             df.to_excel(writer, sheet_name=target, index=False)
     except PermissionError:
-        print(f"    GAGAL raw: {berkas.name} sedang dibuka di Excel")
+        catat(f"    GAGAL raw: {berkas.name} sedang dibuka di Excel")
         return False
-    print(f"    raw/{berkas.name} [{target}] <- {df.shape[0]} baris x {df.shape[1]} kolom")
+    catat(f"    raw/{berkas.name} [{target}] <- {df.shape[0]} baris x {df.shape[1]} kolom")
     return True
 
 
 def tulis_workbook(hasil: dict[str, pd.DataFrame]) -> bool:
     """Tulis semua dataset ke sheet ROH/INT/RT di workbook utama."""
     if not EXCEL_PATH.exists():
-        print(f"Lewat workbook: {EXCEL_PATH.name} tidak ditemukan.")
+        catat(f"Lewat workbook: {EXCEL_PATH.name} tidak ditemukan.")
         return False
     try:
         with pd.ExcelWriter(
@@ -239,10 +339,10 @@ def tulis_workbook(hasil: dict[str, pd.DataFrame]) -> bool:
         ) as writer:
             for sheet, df in hasil.items():
                 df.to_excel(writer, sheet_name=sheet, index=False)
-                print(f"    {EXCEL_PATH.name} [{sheet}] <- {df.shape[0]} baris")
+                catat(f"    {EXCEL_PATH.name} [{sheet}] <- {df.shape[0]} baris")
     except PermissionError:
         # bukan error fatal: data mentahnya sudah aman di raw/
-        print(f"Lewat workbook: {EXCEL_PATH.name} sedang dibuka di Excel.")
+        catat(f"Lewat workbook: {EXCEL_PATH.name} sedang dibuka di Excel.")
         return False
     return True
 
@@ -272,28 +372,45 @@ def main() -> int:
     sekarang = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"\ntanggal data: {TANGGAL}   diambil: {sekarang}   session: ...{SESSION[-8:]}")
 
+    global BAR
+    BAR = Progres(len(DATASET) * 3 + (1 if TULIS_WORKBOOK else 0))
+
     hasil: dict[str, pd.DataFrame] = {}
     for sheet, kode_sys in DATASET.items():
-        print(f"[{sheet}] sys={kode_sys}")
+        BAR.label(f"{sheet} menghubungi HDKS")
         try:
-            df = ambil_data(kode_sys)
+            df = ambil_data(kode_sys, sheet)
         except Exception as e:
-            print(f"    gagal: {e}")
+            catat(f"    [{sheet}] gagal: {e}")
+            BAR.maju()
+            BAR.maju()
             continue
+        BAR.maju(f"{sheet} mengolah tabel")
         if df is None or df.empty:
-            print("    tidak ada tabel data")
+            catat(f"    [{sheet}] tidak ada tabel data")
+            BAR.maju()
             continue
-        print(f"    dipakai tabel shape={df.shape}")
         hasil[sheet] = buang_kolom_mw_mx(ke_angka(df))
+        catat(f"    [{sheet}] dipakai tabel shape={df.shape}")
+        BAR.maju()
 
     if not hasil:
+        BAR.tutup("tidak ada data")
         print("Tidak ada data yang bisa ditulis.")
         return 1
 
-    print("\nmenulis hasil:")
-    n_raw = sum(tulis_raw(sheet, df) for sheet, df in hasil.items())
+    n_raw = 0
+    for sheet, df in hasil.items():
+        BAR.label(f"menulis raw/{sheet}.xlsx")
+        n_raw += tulis_raw(sheet, df)
+        BAR.maju()
     if TULIS_WORKBOOK:
+        BAR.label(f"menulis {EXCEL_PATH.name}")
         tulis_workbook(hasil)
+        BAR.maju()
+
+    BAR.tutup()
+    bagan(hasil)
 
     if n_raw == 0:
         print("\nTidak ada satu pun file raw yang berhasil ditulis.")
